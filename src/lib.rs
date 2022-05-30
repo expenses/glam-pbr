@@ -9,6 +9,11 @@ use num_traits::float::Float;
 
 // Workarounds: can't use f32.lerp, f32.clamp or f32.powi.
 
+// https://docs.gl/sl4/reflect
+pub fn reflect(incident: Vec3, normal: Vec3) -> Vec3 {
+    incident - 2.0 * normal.dot(incident) * normal
+}
+
 pub fn light_direction_and_attenuation(
     fragment_position: Vec3,
     light_position: Vec3,
@@ -170,12 +175,21 @@ pub struct BasicBrdfParams {
 
 #[derive(Clone, Copy)]
 pub struct MaterialParams {
-    pub diffuse_colour: Vec3,
+    pub albedo_colour: Vec3,
     pub metallic: f32,
     pub perceptual_roughness: PerceptualRoughness,
     pub index_of_refraction: IndexOfRefraction,
     pub specular_colour: Vec3,
     pub specular_factor: f32,
+}
+
+impl MaterialParams {
+    fn diffuse_colour(&self) -> Vec3 {
+        // Basically the same as c_diff?
+        self.albedo_colour
+            * (1.0 - self.index_of_refraction.to_dielectric_f0())
+            * (1.0 - self.metallic)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -229,7 +243,7 @@ pub fn transmission_btdf(
 
     let fresnel = fresnel_schlick(view_dot_halfway, f0, f90);
 
-    (1.0 - fresnel) * distribution * geometric_shadowing * material_params.diffuse_colour
+    (1.0 - fresnel) * distribution * geometric_shadowing * material_params.albedo_colour
 }
 
 pub struct IblVolumeRefractionParams {
@@ -309,7 +323,7 @@ pub fn ibl_volume_refraction<
         attenuation_distance,
         material_params:
             MaterialParams {
-                diffuse_colour: base_colour,
+                albedo_colour,
                 metallic: _,
                 perceptual_roughness,
                 index_of_refraction,
@@ -350,7 +364,7 @@ pub fn ibl_volume_refraction<
 
     let specular_colour = f0 * brdf.x + f90 * brdf.y;
 
-    (1.0 - specular_colour) * attenuated_colour * base_colour
+    (1.0 - specular_colour) * attenuated_colour * albedo_colour
 }
 
 fn diffuse_brdf(base: Vec3, fresnel: Vec3) -> Vec3 {
@@ -380,20 +394,10 @@ pub fn basic_brdf(params: BasicBrdfParams) -> BrdfResult {
         light,
         light_intensity,
         view,
-        material_params:
-            MaterialParams {
-                diffuse_colour,
-                metallic,
-                perceptual_roughness,
-                index_of_refraction: _,
-                specular_colour: _,
-                specular_factor: _,
-            },
+        material_params,
     } = params;
 
-    let material_params = params.material_params;
-
-    let actual_roughness = perceptual_roughness.as_actual_roughness();
+    let actual_roughness = material_params.perceptual_roughness.as_actual_roughness();
 
     let halfway = Halfway::new(&view, &light);
     let normal_dot_halfway = Dot::new(&normal, &halfway);
@@ -401,7 +405,7 @@ pub fn basic_brdf(params: BasicBrdfParams) -> BrdfResult {
     let normal_dot_light = Dot::new(&normal, &light);
     let view_dot_halfway = Dot::new(&view, &halfway);
 
-    let c_diff = diffuse_colour.lerp(Vec3::ZERO, metallic);
+    let c_diff = material_params.diffuse_colour();
 
     let f0 = calculate_combined_f0(material_params);
     let f90 = calculate_combined_f90(material_params);
@@ -426,7 +430,7 @@ fn calculate_combined_f0(material: MaterialParams) -> Vec3 {
     let dielectric_specular_f0 = material.index_of_refraction.to_dielectric_f0()
         * material.specular_colour
         * material.specular_factor;
-    dielectric_specular_f0.lerp(material.diffuse_colour, material.metallic)
+    dielectric_specular_f0.lerp(material.albedo_colour, material.metallic)
 }
 
 fn calculate_combined_f90(material: MaterialParams) -> Vec3 {
@@ -462,4 +466,115 @@ pub fn compute_f0(
     let metallic_f0 = diffuse_colour;
 
     (1.0 - metallic) * dielectric_f0 + metallic * metallic_f0
+}
+
+#[derive(Copy, Clone)]
+pub struct GgxLutValues {
+    weight: f32,
+    bias: f32,
+}
+
+pub fn ggx_lut_lookup<GSamp: Fn(f32, PerceptualRoughness) -> Vec2>(
+    normal: Normal,
+    view: View,
+    material_params: MaterialParams,
+    ggx_lut_sampler: GSamp,
+) -> GgxLutValues {
+    let normal_dot_view = Dot::new(&normal, &view);
+
+    let lut_values = ggx_lut_sampler(normal_dot_view.value, material_params.perceptual_roughness);
+
+    GgxLutValues {
+        weight: lut_values.x,
+        bias: lut_values.y,
+    }
+}
+
+pub fn ibl_irradiance_lambertian<DSamp: Fn(Vec3) -> Vec3>(
+    normal: Normal,
+    view: View,
+    material_params: MaterialParams,
+    lut_values: GgxLutValues,
+    diffuse_cubemap_sampler: DSamp,
+) -> Vec3 {
+    let normal_dot_view = Dot::new(&normal, &view);
+
+    let irradiance = diffuse_cubemap_sampler(normal.0);
+
+    // see https://bruop.github.io/ibl/#single_scattering_results at Single Scattering Results
+    // Roughness dependent fresnel, from Fdez-Aguera
+
+    let fss_ess = calculate_fss_ess(material_params, normal_dot_view, lut_values);
+
+    // Multiple scattering, from Fdez-Aguera
+    let multiplier = caulcate_fms_ems_plus_kd(material_params, fss_ess, lut_values);
+
+    multiplier * irradiance
+}
+
+pub fn get_ibl_radiance_ggx<SSamp: Fn(Vec3, f32) -> Vec3>(
+    normal: Normal,
+    view: View,
+    material_params: MaterialParams,
+    lut_values: GgxLutValues,
+    mip_count: u32,
+    specular_cubemap_sampler: SSamp,
+) -> Vec3 {
+    let lod = material_params.perceptual_roughness.0 * (mip_count - 1) as f32;
+
+    let normal_dot_view = Dot::new(&normal, &view);
+
+    let reflection = reflect(-view.0, normal.0).normalize();
+
+    let radiance = specular_cubemap_sampler(reflection, lod);
+
+    let fss_ess = calculate_fss_ess(material_params, normal_dot_view, lut_values);
+
+    radiance * fss_ess
+}
+
+// See https://bruop.github.io/ibl/ and
+// 'A Multiple-Scattering Microfacet Model for Real-Time Image-based Lighting':
+// https://www.jcgt.org/published/0008/01/03/paper.pdf
+//
+// Section 'Roughness Dependent Fresnel'
+fn calculate_fss_ess(
+    material_params: MaterialParams,
+    normal_dot_view: Dot<Normal, View>,
+    lut_values: GgxLutValues,
+) -> Vec3 {
+    let f0 = calculate_combined_f0(material_params);
+
+    // Modified fresnel term. Not sure why it can't use the halfway vector.
+    let f_r = Vec3::splat(1.0 - material_params.perceptual_roughness.0).max(f0) - f0;
+
+    // Wierd AF undocumented term from the paper
+    let k_s = f0 + f_r * (1.0 - normal_dot_view.value).powf(5.0);
+
+    // The gltf sample viewer inserts the specular factor here.
+    material_params.specular_factor * k_s * lut_values.weight + lut_values.bias
+}
+
+fn caulcate_fms_ems_plus_kd(
+    material_params: MaterialParams,
+    fss_ess: Vec3,
+    lut_values: GgxLutValues,
+) -> Vec3 {
+    let f0 = calculate_combined_f0(material_params);
+
+    let e_ss = lut_values.weight + lut_values.bias;
+
+    let e_ms = 1.0 - e_ss;
+
+    let f_avg = f0 + (1.0 - f0) / 21.0;
+
+    let f_ms = fss_ess * f_avg / (1.0 - e_ms * f_avg);
+
+    let fms_ems = f_ms * e_ms;
+
+    let e_dss = 1.0 - fss_ess + fms_ems;
+
+    let k_d = material_params.diffuse_colour() * e_dss;
+
+    k_d + fms_ems
 }
