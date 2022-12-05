@@ -184,7 +184,7 @@ pub struct MaterialParams {
 }
 
 impl MaterialParams {
-    fn diffuse_colour(&self) -> Vec3 {
+    pub fn diffuse_colour(&self) -> Vec3 {
         // Basically the same as c_diff?
         self.albedo_colour
             * (1.0 - self.index_of_refraction.to_dielectric_f0())
@@ -373,7 +373,7 @@ fn diffuse_brdf(base: Vec3, fresnel: Vec3) -> Vec3 {
     (1.0 - fresnel.max_element()) * FRAC_1_PI * base
 }
 
-fn specular_brdf(
+pub fn specular_brdf(
     normal_dot_view: Dot<Normal, View>,
     normal_dot_light: Dot<Normal, Light>,
     normal_dot_halfway: Dot<Normal, Halfway>,
@@ -426,14 +426,14 @@ pub fn basic_brdf(params: BasicBrdfParams) -> BrdfResult {
     BrdfResult { diffuse, specular }
 }
 
-fn calculate_combined_f0(material: MaterialParams) -> Vec3 {
+pub fn calculate_combined_f0(material: MaterialParams) -> Vec3 {
     let dielectric_specular_f0 = material.index_of_refraction.to_dielectric_f0()
         * material.specular_colour
         * material.specular_factor;
     dielectric_specular_f0.lerp(material.albedo_colour, material.metallic)
 }
 
-fn calculate_combined_f90(material: MaterialParams) -> Vec3 {
+pub fn calculate_combined_f90(material: MaterialParams) -> Vec3 {
     let dielectric_specular_f90 = Vec3::splat(material.specular_factor);
     dielectric_specular_f90.lerp(Vec3::ONE, material.metallic)
 }
@@ -510,6 +510,39 @@ pub fn ibl_irradiance_lambertian<DSamp: Fn(Vec3) -> Vec3>(
     let multiplier = caulcate_fms_ems_plus_kd(material_params, fss_ess, lut_values);
 
     multiplier * irradiance
+}
+
+#[test]
+fn irradiance_is_zero_with_smooth() {
+    let normal = Normal(Vec3::Y);
+    let view = View(Vec3::Y);
+
+    let material_params = MaterialParams {
+        albedo_colour: Vec3::ONE,
+        metallic: 1.0,
+        perceptual_roughness: PerceptualRoughness(0.0),
+        index_of_refraction: IndexOfRefraction::default(),
+        specular_colour: Vec3::ONE,
+        specular_factor: 1.0,
+    };
+
+    let lut_values = GgxLutValues {
+        weight: 1.0,
+        bias: 0.0,
+    };
+
+    let mip_count = 0;
+    let diffuse_cubemap_sampler = |_| Vec3::ONE;
+
+    let val = ibl_irradiance_lambertian(
+        normal,
+        view,
+        material_params,
+        lut_values,
+        diffuse_cubemap_sampler,
+    );
+
+    assert_eq!(val, Vec3::ZERO);
 }
 
 pub fn get_ibl_radiance_ggx<SSamp: Fn(Vec3, f32) -> Vec3>(
